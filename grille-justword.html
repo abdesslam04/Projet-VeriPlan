@@ -1,0 +1,335 @@
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+import fitz, os
+from datetime import datetime
+from docx import Document
+from check import generate_checklist
+from docx2pdf import convert 
+from course_data import course_infos
+import mysql.connector
+
+# MySQL config
+db_config = {
+    "user": "him",
+    "password": "",
+    "database": "veriplan",
+    "unix_socket": "/Applications/XAMPP/xamppfiles/var/mysql/mysql.sock"
+}
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+sessions = {}
+
+def find_user(email, password):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(dictionary=True)
+    query = """
+        SELECT utilisateur.*, role.nom AS role
+        FROM utilisateur
+        JOIN role ON utilisateur.id_role = role.id
+        WHERE utilisateur.email = %s AND utilisateur.mot_de_passe = %s
+    """
+    cursor.execute(query, (email, password))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return user
+
+def get_user_by_email(email):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM utilisateur WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return user
+
+@app.get("/", response_class=HTMLResponse)
+def login_page():
+    return """
+    <html>
+    <head><title>VeriPlan - Connexion</title><link rel="stylesheet" href="/static/style2.css"></head>
+    <body>
+        <div class="login-box fade-in">
+            <h2>Connexion VeriPlan</h2>
+            <form method="post" action="/login">
+                <input name="email" type="text" placeholder="Email" required><br>
+                <input name="password" type="password" placeholder="Mot de passe" required><br>
+                <input type="submit" value="Se connecter" class="btn">
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/login", response_class=HTMLResponse)
+def login(email: str = Form(...), password: str = Form(...)):
+    user = find_user(email, password)
+    if not user:
+        return HTMLResponse("""
+        <html><head><title>Connexion</title><link rel="stylesheet" href="/static/style2.css"></head>
+        <body>
+            <div class="login-box">
+                <h2>Connexion VeriPlan</h2>
+                <p style="color:red;">Email ou mot de passe incorrect. Veuillez réessayer.</p>
+                <form method="post" action="/login">
+                    <input name="email" type="text" placeholder="Email" required><br>
+                    <input name="password" type="password" placeholder="Mot de passe" required><br>
+                    <input type="submit" value="Se connecter" class="btn">
+                </form>
+            </div>
+        </body></html>
+        """)
+    sessions[email] = user["role"]
+    return RedirectResponse(url=f"/home?email={email}", status_code=303)
+
+@app.get("/home", response_class=HTMLResponse)
+def home(email: str):
+    role = sessions.get(email)
+    if not role:
+        return RedirectResponse(url="/")
+
+    show_upload = role == "Enseignant"
+    show_analyze = role == "Conseillère pédagogique"
+    show_grille = role in ["Conseillère pédagogique", "Chef d’équipe", "Directeur adjoint"]
+
+    html = f"""
+    <html>
+    <head>
+        <title>VeriPlan - Accueil</title>
+        <link rel="stylesheet" href="/static/style2.css">
+    </head>
+    <body>
+        <div class="container fade-in">
+            <h2>Bienvenue, {email} ({role})</h2>
+    """
+
+    if show_upload:
+        html += f"""
+        <h3>📤 Soumettre un plan de cours</h3>
+        <form action="/upload" enctype="multipart/form-data" method="post">
+            <input type="file" name="file" accept=".pdf" required><br>
+            <input type="text" name="course_code" placeholder="Numéro du cours" required><br>
+            <input type="hidden" name="email" value="{email}">
+            <input type="submit" value="Téléverser" class="btn">
+        </form><hr>
+        """
+
+    if show_analyze:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT plan.id, utilisateur.nom AS enseignant, plan.nom_fichier, plan.date_upload, plan.cours, plan.statut
+            FROM plan
+            JOIN utilisateur ON plan.id_enseignant = utilisateur.id
+            WHERE plan.statut = 'non_analyse'
+            ORDER BY plan.date_upload DESC
+        """)
+        plans = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        html += """
+        <h3>📚 Plans soumis</h3>
+        <label for="filter-select">🔎 Filtrer par :</label>
+        <select id="filter-select">
+            <option value="0">Nom de l’enseignant</option>
+            <option value="1">Nom du cours</option>
+        </select>
+        <input type="text" id="filter-input" placeholder="Entrez un mot-clé..." style="margin-left:10px; padding:8px; border-radius:8px; width:250px;">
+        <table id="plan-table" class="fade-in">
+            <tr><th>Enseignant</th><th>Cours</th><th>Action</th></tr>
+        """
+        for plan in plans:
+            html += f"""
+            <tr>
+                <td>{plan['enseignant']}</td>
+                <td>{plan['cours']}</td>
+                <td>
+                    <form action="/analyze" method="post">
+                        <input type="hidden" name="filename" value="{plan['nom_fichier']}">
+                        <input type="hidden" name="course_code" value="{plan['cours']}">
+                        <input type="hidden" name="email" value="{email}">
+                        <input type="submit" value="Analyser" class="btn">
+                    </form>
+                </td>
+            </tr>
+            """
+        html += "</table>"
+
+        html += """
+        <script>
+        document.addEventListener("DOMContentLoaded", function () {
+            const input = document.getElementById("filter-input");
+            const select = document.getElementById("filter-select");
+            const table = document.getElementById("plan-table");
+
+            input.addEventListener("keyup", function () {
+                const keyword = input.value.toLowerCase();
+                const column = parseInt(select.value);
+                for (let i = 1; i < table.rows.length; i++) {
+                    const cell = table.rows[i].cells[column];
+                    if (cell) {
+                        const txt = cell.textContent.toLowerCase();
+                        table.rows[i].style.display = txt.includes(keyword) ? "" : "none";
+                    }
+                }
+            });
+        });
+        </script>
+        """
+
+    if show_grille:
+        html += "<p>✅ Vous pouvez remplir la grille de validation</p>"
+
+    html += f"""
+        <a href="/logout?email={email}"><button class="btn">Déconnexion</button></a>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+@app.post("/upload", response_class=HTMLResponse)
+async def upload(file: UploadFile = File(...), course_code: str = Form(...), email: str = Form(...)):
+    user = get_user_by_email(email)
+    if not user:
+        return HTMLResponse("<h3>Utilisateur non trouvé.</h3>")
+
+    contents = await file.read()
+    pdf = fitz.open(stream=contents, filetype="pdf")
+    extracted_text = "".join([page.get_text("text", sort=True) for page in pdf])
+    pdf.close()
+
+    filename = file.filename
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO plan (nom_fichier, cours, date_upload, statut, id_enseignant, texte_extrait)
+        VALUES (%s, %s, NOW(), 'non_analyse', %s, %s)
+    """, (filename, course_code, user["id"], extracted_text))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return RedirectResponse(url=f"/home?email={email}", status_code=303)
+
+@app.post("/analyze", response_class=HTMLResponse)
+async def analyze(filename: str = Form(...), course_code: str = Form(...), email: str = Form(...)):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(dictionary=True, buffered=True)
+    cursor.execute("SELECT id, texte_extrait FROM plan WHERE nom_fichier = %s", (filename,))
+    plan_row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not plan_row or not plan_row["texte_extrait"]:
+        return HTMLResponse("<h3>Erreur : texte non trouvé dans la base de données.</h3>")
+
+    id_plan = plan_row["id"]
+    text = plan_row["texte_extrait"]
+
+    reference_data = course_infos.get(course_code, {})
+    results = generate_checklist(text, reference_data)
+
+    template_path = "2._Grille_validation_plan_de_cours.docx"
+    output_path = f"Grille_{filename.replace('.pdf', '')}.docx"
+    docx_template = Document(template_path)
+    
+    for para in docx_template.paragraphs:
+        if "Numéro de cours" in para.text:
+            para.text = f"Numéro du cours : {course_code}"
+        if "Titre du cours" in para.text:
+            para.text = f"Titre du cours : {reference_data.get('title', 'N/A')}"
+        if "Vérificateur" in para.text:
+            para.text = "Vérificateur : Amir Bessire"
+        if "Date" in para.text:
+            para.text = f"Date : {datetime.today().strftime('%d/%m/%Y')}"
+
+    for table in docx_template.tables:
+        for row in table.rows[1:]:
+            label = row.cells[0].text.strip().split("\n")[0]
+            status = results.get(label)
+            if isinstance(status, tuple):
+                status = status[0]
+            if status == "✅":
+                row.cells[1].text = "✅ Oui"
+                row.cells[2].text = ""
+            elif status == "❌":
+                row.cells[1].text = "❌ Non"
+                row.cells[2].text = "Élément manquant ou mal formulé"
+
+    docx_template.save(output_path)
+
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(buffered=True)
+
+    try:
+        cursor.execute("SELECT id FROM utilisateur WHERE email = %s", (email,))
+        user_row = cursor.fetchone()
+        cursor.fetchall()  # 👈 ensures no unread result
+        if not user_row:
+            return HTMLResponse("<h3>Erreur : utilisateur vérificateur introuvable.</h3>")
+        id_ce = user_row[0]
+
+        grille_summary = "\n".join([f"{k}: {v[0] if isinstance(v, tuple) else v}" for k, v in results.items()])
+
+        cursor.execute("""
+            INSERT INTO grille_validation (id_ce, id_plan, resultat_grille)
+            VALUES (%s, %s, %s)
+        """, (id_ce, id_plan, grille_summary))
+
+        cursor.execute("UPDATE plan SET statut = 'valide' WHERE id = %s", (id_plan,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+        grille_html = ""
+    for k, v in results.items():
+        status = v[0] if isinstance(v, tuple) else v
+        comment = v[1] if isinstance(v, tuple) and len(v) > 1 else ""
+        grille_html += f"""
+            <tr>
+                <td>{k}</td>
+                <td>{'✅ Oui' if status == '✅' else '❌ Non'}</td>
+                <td>{comment if status == '❌' else ''}</td>
+            </tr>
+        """
+
+    return HTMLResponse(f"""
+    <html><head><link rel="stylesheet" href="/static/style2.css"></head>
+    <body>
+        <div class="container fade-in">
+            <h3>✅ Analyse terminée pour le cours <b>{course_code}</b></h3>
+            <h4>📋 Résultat de la grille de validation :</h4>
+            <table border="1" cellpadding="10" style="border-collapse: collapse;">
+                <tr>
+                    <th>Critère</th>
+                    <th>Présence</th>
+                    <th>Commentaire</th>
+                </tr>
+                {grille_html}
+            </table>
+            <br>
+            <a href="/download-report?path={output_path}">
+                <button class="btn">📥 Télécharger la grille complétée</button>
+            </a><br><br>
+            <a href="/home?email={email}">
+                <button class="btn">⬅ Retour à la liste</button>
+            </a>
+        </div>
+    </body></html>
+    """)
+
+
+@app.get("/download-report")
+def download_report(path: str):
+    return FileResponse(path, media_type='application/octet-stream', filename=os.path.basename(path))
+
+@app.get("/logout")
+def logout(email: str):
+    sessions.pop(email, None)
+    return RedirectResponse(url="/", status_code=303)

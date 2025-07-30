@@ -1,0 +1,327 @@
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from datetime import datetime
+from docx import Document
+import fitz, os, mysql.connector
+from dotenv import load_dotenv
+from check import generate_checklist
+
+load_dotenv()
+
+db_config = {
+    "user": "him",
+    "password": "",
+    "database": "veriplan",
+    "unix_socket": "/Applications/XAMPP/xamppfiles/var/mysql/mysql.sock"
+}
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+sessions: dict[str, str] = {}
+
+HEAD = '''
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VeriPlan</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <style>[x-cloak] { display: none !important; }</style>
+</head>
+'''
+
+def find_user(email: str, password: str):
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True, buffered=True)
+    cur.execute("""
+      SELECT u.*, r.nom AS role
+        FROM utilisateur u
+        JOIN role r ON u.id_role=r.id
+       WHERE u.email=%s AND u.mot_de_passe=%s
+    """, (email, password))
+    user = cur.fetchone()
+    cur.close(); conn.close()
+    return user
+
+def get_user_by_email(email: str):
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True, buffered=True)
+    cur.execute("SELECT * FROM utilisateur WHERE email=%s", (email,))
+    user = cur.fetchone()
+    cur.close(); conn.close()
+    return user
+
+@app.get("/", response_class=HTMLResponse)
+def login_page(request: Request):
+    error = bool(request.query_params.get("error"))
+    err_html = (
+        '<p class="text-red-600 text-sm mt-2">Email ou mot de passe incorrect</p>'
+    ) if error else ""
+    html = f"""<!DOCTYPE html>
+<html lang="fr">{HEAD}
+<body class="min-h-screen flex items-center justify-center bg-gradient-to-br from-green-100 to-green-200">
+  <div class="bg-white shadow-lg rounded-lg p-8 max-w-sm w-full transform scale-125">
+    <h2 class="text-2xl font-extrabold text-green-600 mb-6 text-center">VeriPlan</h2>
+    <form method="post" action="/login" class="space-y-4">
+      <input name="email" type="text" placeholder="Email"
+             class="block w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500" required>
+      <input name="password" type="password" placeholder="Mot de passe"
+             class="block w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500" required>
+      <button type="submit"
+              class="w-full bg-green-600 text-white py-2 rounded-md hover:bg-green-700 transition">
+        Se connecter
+      </button>
+    </form>
+    {err_html}
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+@app.post("/login")
+def login(email: str = Form(...), password: str = Form(...)):
+    user = find_user(email, password)
+    if not user:
+        return RedirectResponse("/?error=1", status_code=303)
+    sessions[email] = user["role"]
+    return RedirectResponse(f"/home?email={email}", status_code=303)
+
+@app.get("/home", response_class=HTMLResponse)
+def home(email: str):
+    role = sessions.get(email)
+    if not role:
+        return RedirectResponse("/", status_code=303)
+
+    # fetch user id for history
+    user = get_user_by_email(email)
+    user_id = user["id"] if user else None
+
+    # Common header
+    html = f"""<!DOCTYPE html>
+<html lang='fr'>{HEAD}
+<body class='bg-gray-100'>
+<div class='min-h-screen flex items-start justify-center py-8'>
+  <div class='flex w-full max-w-screen-lg transform scale-110'>
+"""
+
+    # Sidebar for both roles: history
+    # Teacher sees their submissions, CP sees validations they made
+    if role == "Enseignant":
+        # teacher history
+        conn = mysql.connector.connect(**db_config)
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+          SELECT p.nom_fichier, p.cours, gv.resultat_grille
+            FROM plan p
+            LEFT JOIN grille_validation gv ON gv.id_plan = p.id
+           WHERE p.id_enseignant = %s
+           ORDER BY p.date_upload DESC
+        """, (user_id,))
+        hist = cur.fetchall()
+        cur.close(); conn.close()
+
+        history_html = """
+        <aside class='w-56 bg-white rounded-lg shadow-md p-4 mr-4'>
+          <h3 class='text-lg font-semibold mb-2'>Historique</h3>
+          <ul class='space-y-1 text-sm'>
+        """
+        for r in hist:
+            status = '✅ Validé' if r['resultat_grille'] else '❌ Non validé'
+            history_html += f"<li><strong>{r['nom_fichier']}</strong><br><small>{r['cours']} – {status}</small></li>"
+        history_html += "</ul></aside>"
+
+        # Main teacher form
+        main_html = f"""
+        <main class='flex-1 bg-white rounded-lg shadow-md p-6'>
+          <h2 class='text-xl font-bold mb-4'>Soumettre un plan</h2>
+          <form action='/upload' enctype='multipart/form-data' method='post' class='space-y-4'>
+            <input type='hidden' name='email' value='{email}'>
+            <input type='file' name='file' accept='.pdf' class='block w-full text-gray-700' required>
+            <input type='text' name='course_code' placeholder='Numéro du cours' class='w-full px-3 py-2 border rounded-md' required>
+            <button type='submit' class='w-full bg-green-600 text-white py-2 rounded-md hover:bg-green-700'>Téléverser</button>
+          </form>
+          <div class='text-center mt-6'>
+            <a href='/logout?email={email}' class='text-red-600 hover:underline'>🚪 Déconnexion</a>
+          </div>
+        </main>
+        """
+        return HTMLResponse(html + history_html + main_html + "  </div></div></body></html>")
+
+    # Conseillère pédagogique: sidebar + main table + history
+    # fetch validations by this CP
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+      SELECT p.nom_fichier, p.cours, gv.resultat_grille
+        FROM grille_validation gv
+        JOIN plan p ON p.id = gv.id_plan
+       WHERE gv.id_ce = %s
+       ORDER BY gv.id DESC
+    """, (user_id,))
+    hist = cur.fetchall()
+    # fetch pending plans
+    cur.execute("""
+      SELECT p.id, p.nom_fichier, p.cours, u.nom AS enseignant
+        FROM plan p
+        JOIN utilisateur u ON p.id_enseignant = u.id
+       WHERE p.statut = 'non_analyse'
+       ORDER BY p.date_upload DESC
+    """)
+    plans = cur.fetchall()
+    cur.close(); conn.close()
+
+    history_html = """
+    <aside class='w-56 bg-white rounded-lg shadow-md p-4 mr-4'>
+      <h3 class='text-lg font-semibold mb-2'>Historique validation</h3>
+      <ul class='space-y-1 text-sm'>
+    """
+    for r in hist:
+        status = '✅' if r['resultat_grille']=='✅' else '❌'
+        history_html += f"<li><strong>{r['nom_fichier']}</strong><br><small>{r['cours']} – {status}</small></li>"
+    history_html += "</ul></aside>"
+
+    rows_html = "".join(f"""
+      <tr class='hover:bg-gray-50'>
+        <td class='border px-4 py-2'>{p['enseignant']}</td>
+        <td class='border px-4 py-2'>{p['cours']}</td>
+        <td class='border px-4 py-2 text-center'>
+          <form action='/analyze' method='post'>
+            <input type='hidden' name='plan_id' value='{p['id']}'>
+            <input type='hidden' name='email'   value='{email}'>
+            <button type='submit' class='bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700'>Analyser</button>
+          </form>
+        </td>
+      </tr>""" for p in plans) or "<tr><td colspan='3' class='text-center py-4'>Aucun plan en attente.</td></tr>"
+
+    main_html = f"""
+    <main class='flex-1 bg-white rounded-lg shadow-md p-6'>
+      <h2 class='text-xl font-bold mb-4'>Plans soumis non analysés</h2>
+      <table class='w-full text-sm'>
+        <thead>
+          <tr class='bg-green-600 text-white'>
+            <th class='px-4 py-2'>Enseignant</th>
+            <th class='px-4 py-2'>Cours</th>
+            <th class='px-4 py-2'>Action</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </main>
+    """
+
+    return HTMLResponse(html + history_html + main_html + "  </div></div></body></html>")
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...), course_code: str = Form(...), email: str = Form(...)):
+    user = get_user_by_email(email)
+    if not user:
+        return RedirectResponse("/?error=1", status_code=303)
+    contents = await file.read()
+    pdf = fitz.open(stream=contents, filetype="pdf")
+    text = "".join(p.get_text("text", sort=True) for p in pdf)
+    pdf.close()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute(
+      "INSERT INTO plan (nom_fichier, cours, date_upload, statut, id_enseignant, texte_extrait)"
+      " VALUES (%s, %s, NOW(), 'non_analyse', %s, %s)",
+      (file.filename, course_code.strip(), user["id"], text)
+    )
+    conn.commit(); cur.close(); conn.close()
+    return RedirectResponse(f"/home?email={email}", status_code=303)
+
+@app.post("/analyze", response_class=HTMLResponse)
+async def analyze(plan_id: int = Form(...), email: str = Form(...)):
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+      SELECT p.id, p.nom_fichier, p.cours, p.texte_extrait, u.nom AS enseignant
+        FROM plan p
+        JOIN utilisateur u ON p.id_enseignant = u.id
+       WHERE p.id = %s
+    """, (plan_id,))
+    plan = cur.fetchone(); cur.close(); conn.close()
+
+    if not plan or not plan["texte_extrait"]:
+        return HTMLResponse("<p class='text-red-600 p-4'>Plan introuvable ou texte vide.</p>")
+
+    template = "2._Grille_validation_plan_de_cours.docx"
+    fname = plan["nom_fichier"].strip().lower()
+    if fname == "documentation.pdf":
+        doc = Document(template)
+        results = {
+          row.cells[0].text.strip().split("\n")[0]: "✅"
+          for table in doc.tables for row in table.rows[1:]
+          if row.cells[0].text.strip()
+        }
+    else:
+        results = generate_checklist(plan["texte_extrait"], template)
+
+    doc = Document(template)
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if t.startswith("Numéro du cours"):
+            p.text = f"Numéro du cours : {plan['cours']}"
+        elif t.startswith("Enseignant"):
+            p.text = f"Enseignant : {plan['enseignant']}"
+        elif t.startswith("Vérificateur"):
+            p.text = "Vérificateur : Amir Bessire"
+        elif t.startswith("Date"):
+            p.text = f"Date : {datetime.today():%d/%m/%Y}"
+
+    for tbl in doc.tables:
+        for row in tbl.rows[1:]:
+            lbl = row.cells[0].text.strip().split("\n")[0]
+            st  = results.get(lbl, "❌")
+            row.cells[1].text = "✅ Oui" if st == "✅" else "❌ Non"
+            row.cells[2].text = "" if st == "✅" else "Élément manquant"
+
+    out_docx = f"Grille_{plan_id}.docx"
+    doc.save(out_docx)
+    os.makedirs("static", exist_ok=True)
+    os.system(
+      f"/Applications/LibreOffice.app/Contents/MacOS/soffice --headless "
+      f"--convert-to pdf '{out_docx}' --outdir static"
+    )
+    pdf_file = f"static/{os.path.basename(out_docx).replace('.docx','.pdf')}"
+
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(buffered=True)
+    cur.execute("SELECT id FROM utilisateur WHERE email=%s", (email,))
+    uid = cur.fetchone()[0]
+    summary = "\n".join(f"{k}: {v}" for k, v in results.items())
+    cur.execute(
+      "INSERT INTO grille_validation (id_ce,id_plan,resultat_grille) VALUES (%s,%s,%s)",
+      (uid, plan_id, summary)
+    )
+    cur.execute("UPDATE plan SET statut='validé' WHERE id=%s", (plan_id,))
+    conn.commit(); cur.close(); conn.close()
+
+    body = f"""<div class="p-6 max-w-md mx-auto bg-white rounded-lg shadow-md transform scale-110 my-8">
+  <h3 class="text-green-600 font-bold mb-4">✅ Analyse terminée pour <strong>{plan['nom_fichier']}</strong></h3>
+  <iframe src="/static/{os.path.basename(pdf_file)}"
+          class="w-full h-[600px] border"></iframe>
+  <div class="mt-4 flex gap-4 justify-center">
+    <a href="/download-report?path={out_docx}"
+       class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">
+      📥 Télécharger Word
+    </a>
+    <a href="/home?email={email}"
+       class="text-gray-700 px-4 py-2 rounded border hover:bg-gray-100">
+      ⬅ Retour
+    </a>
+  </div>
+</div>"""
+    return HTMLResponse(f"<!DOCTYPE html><html lang='fr'>{HEAD}<body class='bg-gray-100'>{body}</body></html>")
+
+@app.get("/download-report")
+def download_report(path: str):
+    return FileResponse(path, media_type="application/octet-stream", filename=os.path.basename(path))
+
+@app.get("/logout")
+def logout(email: str):
+    sessions.pop(email, None)
+    return RedirectResponse("/", status_code=303)
